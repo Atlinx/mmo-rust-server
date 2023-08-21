@@ -1,10 +1,13 @@
 [package]
 name = "game_server"
 version = "0.1.0"
-authors = ["Jay Butera <buterajay@gmail.com>"]
-edition = "2018"
+edition = "2021"
 
 [dependencies]
-futures = "0.1"
-tokio = "0.1"
-websocket = "0.22.0"
+log = "0.4"
+env_logger = "0.10"
+tokio-tungstenite = "*"
+tokio = { version="1.32", features = ["full"] }
+futures-util = "0.3"
+bytebuffer = "2.1"
+num_enum = "0.7"

@@ -1,171 +1,211 @@
-extern crate futures;
-extern crate tokio;
-extern crate websocket;
+use bytebuffer::ByteBuffer;
+use env_logger;
+use futures_util::{
+    stream::{SplitSink, SplitStream},
+    SinkExt, StreamExt,
+};
+use log::{error, info};
+use num_enum::{IntoPrimitive, TryFromPrimitive};
+use std::{collections::HashMap, env, fmt::Display, hash::Hash, io::Error, sync::Arc};
+use tokio::{
+    net::{TcpListener, TcpStream},
+    sync::{Mutex, RwLock},
+};
+use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
-pub mod types;
+#[tokio::main]
+async fn main() -> Result<(), Error> {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Debug)
+        .init();
 
-use tokio::runtime;
-use tokio::runtime::TaskExecutor;
+    let addr = env::args()
+        .nth(1)
+        .unwrap_or_else(|| "127.0.0.1:9000".to_string());
+    let try_socket = TcpListener::bind(&addr).await;
+    let listener = try_socket.expect("Failed to bind");
+    info!("Listening on: {}", addr);
 
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::time::{Duration, Instant};
+    let mut next_socket_id: u32 = 0;
+    let world = Arc::new(RwLock::new(World::new()));
 
-use websocket::message::OwnedMessage;
-use websocket::server::InvalidConnection;
-use websocket::server::r#async::Server;
+    while let Ok((stream, _)) = listener.accept().await {
+        tokio::spawn(accept_connection(stream, next_socket_id, world.clone()));
+        next_socket_id += 1;
+    }
 
-use futures::{Future,Stream,Sink};
-use futures::future::{self, Loop};
-
-use std::sync::{Arc,RwLock};
-
-fn main() {
-    let runtime  = runtime::Builder::new().build().unwrap();
-    let executor = runtime.executor();
-    let server   = Server::bind("127.0.0.1:8080", &runtime.reactor()).expect("Failed to create server");
-
-    // Hashmap to store a sink value with an id key
-    // A sink is used to send data to an open client connection
-    let connections = Arc::new(RwLock::new(HashMap::new()));
-    // Hashmap of id:entity pairs. This is basically the game state
-    let entities    = Arc::new(RwLock::new(HashMap::new()));
-    // Used to assign a unique id to each new player
-    let counter     = Arc::new(RwLock::new(0));
-
-    // Clone references to these states in order to move into the connection_handler closure
-    let connections_inner = connections.clone();
-    let entities_inner    = entities.clone();
-    let executor_inner    = executor.clone();
-
-    // This stream spawns a future on each new connection request from a client
-    // The interesting part is the closure in "for_each" (line 46)
-    let connection_handler = server.incoming()
-        .map_err(|InvalidConnection { error, .. }| error)
-        .for_each(move |(upgrade, addr)| {
-            // Clone again to move into closure "f"
-            let connections_inner = connections_inner.clone();
-            let entities          = entities_inner.clone();
-            let counter_inner     = counter.clone();
-            let executor_2inner   = executor_inner.clone();
-
-            // This future completes the connection and then proceses the sink and stream
-            let accept = upgrade.accept().and_then(move |(framed,_)| {
-                let (sink, stream) = framed.split();
-
-                { // Increment the counter by first locking the RwLock
-                    let mut c = counter_inner.write().unwrap();
-                    *c += 1;
-                }
-
-                // Assign an id to the new connection and associate with a new entity and the sink
-                let id = *counter_inner.read().unwrap();
-                connections_inner.write().unwrap().insert(id,sink);
-                entities.write().unwrap().insert(id, types::Entity{id, pos:(0,0)} ); // Start at position 0
-                let c = *counter_inner.read().unwrap();
-
-                // Spawn a stream to process future messages from this client
-                let f = stream.for_each(move |msg| {
-                    process_message(c, &msg, entities.clone());
-                    Ok(())
-                }).map_err(|_| ());
-
-                executor_2inner.spawn(f);
-
-                Ok(())
-            }).map_err(|_| ());
-
-            executor_inner.spawn(accept);
-            Ok(())
-        })
-        .map_err(|_| ());
-
-    // This stream is the game loop
-    let send_handler = future::loop_fn((), move |_| {
-        // This time we clone because "and_then" (line 94) takes a FnMut closure which
-        let connections_inner = connections.clone();
-        let executor          = executor.clone();
-        let entities_inner    = entities.clone();
-
-        // Delay makes the loop run just 10 times a second
-        tokio::timer::Delay::new(Instant::now() + Duration::from_millis(100))
-            .map_err(|_| ())
-            .and_then(move |_| {
-                let mut conn = connections_inner.write().unwrap();
-                let ids = conn.iter().map(|(k,v)| { k.clone() }).collect::<Vec<_>>();
-
-                for id in ids.iter() {
-                    // Must take ownership of the sink to send on it
-                    // The only way to take ownership of a hashmap value is to remove it
-                    // And later put it back (line 124)
-                    let sink = conn.remove(id).unwrap();
-
-                    /* Meticulously serialize entity vector into json */
-                    let entities = entities_inner.read().unwrap();
-                    let first = match entities.iter().take(1).next() {
-                        Some((_,e)) => e,
-                        None => return Ok(Loop::Continue(())),
-                    };
-                    let serial_entities = format!("[{}]", entities.iter().skip(1)
-                                                  .map(|(_,e)| e.to_json())
-                                                  .fold(first.to_json(), |acc,s| format!("{},{}",s,acc)));
-                    /**/
-
-                    // Clone for future "f"
-                    let connections = connections_inner.clone();
-                    let id = id.clone();
-
-                    // This is where the game state is actually sent to the client
-                    let f = sink
-                        .send(OwnedMessage::Text(serial_entities))
-                        .and_then(move |sink| {
-                            // Re-insert the entry to the connections map
-                            connections.write().unwrap().insert( id.clone(), sink );
-                            Ok(())
-                        })
-                        .map_err(|_| ());
-
-                    executor.spawn(f);
-                }
-
-                // Damn type inference...
-                // This would just return "Continue" if it could for an infinite loop
-                match true {
-                    true => Ok(Loop::Continue(())),
-                    false => Ok(Loop::Break(())),
-                }
-            })
-    });
-
-    // Finally, block the main thread to wait for the connection_handler and send_handler streams
-    // to finish. Which they never should unless there is an error
-    runtime
-        .block_on_all(connection_handler.select(send_handler))
-        .map_err(|_| println!("Error while running core loop"))
-        .unwrap();
+    Ok(())
 }
 
-// Update a player's entity state depending on the command they sent
-fn process_message(
-    id: u32,
-    msg: &OwnedMessage,
-    entities: Arc<RwLock<HashMap<u32,types::Entity>>>
-) {
-    if let OwnedMessage::Text(ref txt) = *msg {
-        // For fun
-        println!("Received msg '{}' from id {}", txt, id);
+async fn accept_connection(stream: TcpStream, socket_id: u32, world: Arc<RwLock<World>>) {
+    let addr = stream
+        .peer_addr()
+        .expect("connected streams should have a peer address");
+    info!("Peer address: {}", addr);
 
-        if txt == "right" {
-            entities.write().unwrap().entry(id).and_modify(|e| { e.pos.0 += 10 });
+    let ws_stream = tokio_tungstenite::accept_async(stream)
+        .await
+        .expect("Error during the websocket handshake occurred");
+    info!(
+        "New WebSocket connection: {} Socket ID: {}",
+        addr, socket_id
+    );
+
+    let (mut write, mut read) = ws_stream.split();
+
+    {
+        // Insert a new player for this socket
+        let mut world = world.write().await;
+        world.entities.insert(socket_id, Entity::new(socket_id));
+    }
+
+    loop {
+        match read.next().await {
+            Some(msg) => match msg {
+                Ok(msg) => {
+                    let result = process_message(socket_id, world.clone(), msg, &mut write).await;
+                    if let Err(e) = result {
+                        error!("Error processing message: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    error!("Error reading WebSocket message: {}", e);
+                    break;
+                }
+            },
+            None => break,
         }
-        else if txt == "left" {
-            entities.write().unwrap().entry(id).and_modify(|e| { e.pos.0 -= 10 });
+    }
+
+    {
+        // Remove the player for this socket
+        let mut world = world.write().await;
+        world.entities.remove(&socket_id);
+    }
+}
+
+async fn process_message(
+    socket_id: u32,
+    world: Arc<RwLock<World>>,
+    message: Message,
+    write: &mut WriteSource,
+) -> Result<(), MessageError> {
+    info!("Got message: {}", message);
+    let mut buffer = ByteBuffer::from_vec(message.into_data());
+    let packet_id = PacketID::try_from_primitive(
+        buffer
+            .read_u8()
+            .map_err(|_| MessageError::UnprocessableInput("Could not read u8.".to_owned()))?,
+    )
+    .map_err(|_| MessageError::UnprocessableInput("Could not cast u8 to PacketID.".to_owned()))?;
+
+    process_packet(socket_id, world, packet_id, buffer, write).await
+}
+
+async fn process_packet(
+    socket_id: u32,
+    world: Arc<RwLock<World>>,
+    packet_id: PacketID,
+    buffer: ByteBuffer,
+    write: &mut WriteSource,
+) -> Result<(), MessageError> {
+    match packet_id {
+        PacketID::MoveLeft => {}
+        PacketID::MoveRight => {}
+        PacketID::MoveUp => {}
+        PacketID::MoveDown => {}
+    }
+    Ok(())
+}
+
+pub type ReadSource = SplitStream<WebSocketStream<TcpStream>>;
+pub type WriteSource = SplitSink<WebSocketStream<TcpStream>, Message>;
+
+#[derive(Debug)]
+pub enum MessageError {
+    UnprocessableInput(String),
+}
+
+impl Display for MessageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnprocessableInput(msg) => write!(f, "UnprocessableInput: {}", msg),
         }
-        else if txt == "down" {
-            entities.write().unwrap().entry(id).and_modify(|e| { e.pos.1 += 10 });
+    }
+}
+
+#[derive(Debug, Eq, PartialEq, TryFromPrimitive, IntoPrimitive)]
+#[repr(u8)]
+pub enum PacketID {
+    MoveLeft = 1,
+    MoveRight = 2,
+    MoveUp = 3,
+    MoveDown = 4,
+}
+
+pub struct Vec2 {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Vec2 {
+    pub fn new(x: f32, y: f32) -> Self {
+        Vec2 { x, y }
+    }
+
+    pub fn zero() -> Self {
+        Vec2::new(0f32, 0f32)
+    }
+}
+
+pub struct Player<'a> {
+    pub entity: &'a Entity,
+    pub connection_read: ReadSource,
+    pub connection_write: Mutex<WriteSource>,
+}
+
+pub struct Entity {
+    pub id: u32,
+    pub pos: Vec2,
+}
+
+impl Entity {
+    pub fn new(id: u32) -> Self {
+        Entity {
+            id,
+            pos: Vec2::zero(),
         }
-        else if txt == "up" {
-            entities.write().unwrap().entry(id).and_modify(|e| { e.pos.1 -= 10 });
+    }
+}
+
+pub struct World<'a> {
+    pub players: HashMap<u32, Player<'a>>,
+    pub entities: HashMap<u32, Entity>,
+    pub next_free_entity_id: u32,
+}
+
+impl<'a> World<'a> {
+    pub fn new() -> Self {
+        World {
+            players: HashMap::<u32, Player>::new(),
+            entities: HashMap::<u32, Entity>::new(),
+            next_free_entity_id: 0,
         }
+    }
+
+    pub fn create_entity(&mut self) -> Entity {
+        let new_entity = Entity::new(self.next_free_entity_id);
+        self.entities.insert(self.next_free_entity_id, new_entity);
+        self.next_free_entity_id += 1;
+        new_entity
+    }
+
+    pub fn remove_entity(&mut self, id: u32) -> Option<Entity> {
+        self.entities.remove(&id)
+    }
+
+    pub fn add_player(player: Player<'a>) {
+        player.entity = create
     }
 }
