@@ -11,3 +11,5 @@ tokio = { version="1.32", features = ["full"] }
 futures-util = "0.3"
 bytebuffer = "2.1"
 num_enum = "0.7"
+async-trait = "0.1"
+lazy_static = "1.4"
